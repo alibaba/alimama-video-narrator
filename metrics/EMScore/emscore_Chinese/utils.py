@@ -1,0 +1,533 @@
+import torch
+# import clip
+from transformers import ChineseCLIPProcessor, ChineseCLIPModel, AutoTokenizer
+import pdb
+from PIL import Image
+import json
+import cv2
+import numpy as np
+from tqdm import tqdm
+import math
+from math import log
+from torch.nn.utils.rnn import pad_sequence
+import sys
+import time
+import os
+from collections import defaultdict, Counter
+from multiprocessing import Pool
+from functools import partial
+from itertools import chain
+import jieba
+import jieba.posseg as pseg
+jieba.initialize()
+jieba.enable_paddle()
+def compute_correlation_uniquehuman(pred, all_human_scores):
+    num_workers = 3
+    import scipy.stats
+
+    pred = np.around(pred, decimals=4)
+
+    spearman = 0
+    for worker_i in range(num_workers):
+        tmp, p_value = scipy.stats.spearmanr(pred, all_human_scores[:, worker_i])
+        assert p_value < 0.01
+        spearman += tmp
+    spearman /= num_workers
+    spearman = np.around(spearman, decimals=4)
+
+    kendalltau = 0
+    for worker_i in range(num_workers):
+        tmp, p_value = scipy.stats.kendalltau(pred, all_human_scores[:, worker_i])
+        assert p_value < 0.01
+        kendalltau += tmp
+    kendalltau /= num_workers
+    kendalltau = np.around(kendalltau, decimals=4)
+
+    print('kendall: {}, spear: {}'.format(kendalltau, spearman))
+    return kendalltau, spearman
+
+def normalize_matrix(A):
+    assert len(A.shape) == 2
+    A_norm = torch.linalg.norm(A, dim=-1, keepdim=True)
+    return A / A_norm
+
+def encode_video(video_file, preprocess, model, batch_size, device):
+
+    cv_start_time = time.perf_counter()
+    cap = cv2.VideoCapture(video_file)
+    frameCount = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    images = []
+    count = 0
+    ret = True
+
+    while (count < frameCount and ret):
+        ret, frame = cap.read()
+        if not ret:  # if file is empty break loop
+            break
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # images.append(preprocess(Image.fromarray(frame_rgb).convert("RGB"), return_tensors="pt"))
+        images.append(Image.fromarray(frame_rgb).convert("RGB"))
+        count += 1
+
+    cv_end_time = time.perf_counter()
+    time_diff = cv_end_time-cv_start_time
+    # print(f"cv done in {time_diff:.2f} seconds")
+
+
+    image_embed_start_time = time.perf_counter()
+    # image_input = torch.tensor(np.stack(images)).to(device)
+    # pdb.set_trace()
+    image_input = preprocess(images=images, return_tensors="pt")['pixel_values']
+    image_features_list = []
+    # bs = 256
+    with torch.no_grad():
+        n_inter = math.ceil(len(image_input)/batch_size)
+        for i in range(n_inter):
+            # image_features = model.encode_image(image_input[i*batch_size: (i+1)*batch_size]).float()
+            image_inputs = {}
+            image_inputs['pixel_values'] = image_input[i*batch_size: (i+1)*batch_size]
+            image_features = model.get_image_features(**image_inputs)
+            # image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)  # normalize
+
+            image_features_list.append(image_features)
+    image_features = torch.cat(image_features_list, dim=0)
+    image_features /= image_features.norm(dim=-1, keepdim=True)
+    cap.release()
+
+    vid_feature = normalize_matrix(torch.mean(image_features, dim=0, keepdim=True)).squeeze()
+
+    image_embed_end_time = time.perf_counter()
+    time_diff = image_embed_end_time - image_embed_start_time
+    # print(f"image embed done in {time_diff:.2f} seconds")
+
+    return image_features, vid_feature
+
+def encode_text(vid_caps, model, text_model, tokenizer, idf_dict, device):
+    # text_input = tokenizer(vid_caps).to(device=device)
+    # with torch.no_grad():
+    #     text_features = model.encode_text(text_input, local=True).float()
+    # text_features /= text_features.norm(dim=-1, keepdim=True)
+
+    left_pos = ["n", "s", "nr", "ns", "nt", "nw", "nz", "v", "vn", "a"]
+    #left_pos = ["n","v","a"]
+    t_length = 0
+    cap_word_length = [0]
+    vid_words = []
+
+    for cap in vid_caps:
+        words = pseg.cut(cap, use_paddle=True)
+        t_ws = []
+        first_word = None
+        for word, flag in words:
+            if(first_word is None):first_word=word
+            if (flag in left_pos):# or word in "电动牙刷"):
+                t_ws.append(word)
+                vid_words.append(word)
+        if(len(t_ws)==0):
+            t_ws.append(first_word)
+            vid_words.append(first_word)
+        t_length+=len(t_ws)
+        cap_word_length.append(t_length)
+    print(vid_words)
+    #text_inputs = tokenizer(vid_caps, padding=True, return_tensors="pt") #.to(device=device)
+    text_inputs = tokenizer(vid_words, padding=True, return_tensors="pt")
+    sen_inputs = tokenizer(vid_caps, padding=True, return_tensors="pt")
+    #print(text_inputs)
+    with torch.no_grad():
+        '''
+        output_attentions = model.config.output_attentions
+        output_hidden_states = (
+            model.config.output_hidden_states
+        )
+        return_dict = model.config.use_return_dict
+
+        text_outputs = model.text_model(
+            input_ids=text_inputs["input_ids"],
+            attention_mask=text_inputs["attention_mask"],
+            token_type_ids=text_inputs["token_type_ids"],
+            position_ids=None,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        #text_features = model.text_projection(outputs.last_hidden_state)
+        pooled_output = text_outputs[0][:, 0, :]
+        word_features = text_outputs.last_hidden_state
+        text_features = model.text_projection(pooled_output).float()#model.get_text_features(**text_inputs).float()#model.text_projection(pooled_output).float()
+        word_features = model.text_projection(word_features).float()
+        #print(text_features.shape)# [4, 512]
+        '''
+        text_features = model.get_text_features(**text_inputs).float()#model.text_projection(pooled_output).float()
+        sen_features = model.get_text_features(**sen_inputs).float()
+        #word_features = text_features
+    text_features = text_features / text_features.norm(dim=-1, keepdim=True)  # normalize
+    sen_features = sen_features / sen_features.norm(dim=-1, keepdim=True)
+    #按照每句cap的word数量进行feature的分配
+    word_features = []
+    for t_i,t_length in enumerate(cap_word_length[:-1]):
+        word_features.append(text_features[t_length:cap_word_length[t_i+1]].to(device))
+
+    #word_features = word_features / word_features.norm(dim=-1, keepdim=True)
+    # import pdb
+    # pdb.set_trace()
+    text_input = text_inputs['input_ids']
+    # For special tokens, use [SOS] and [EOS]
+    # txt_len = text_input.argmax(dim=-1)
+    txt_len = []
+    for i in range(len(text_input)):
+        txt_len.append(list(text_input[i].detach().numpy()).index(102))
+    mask = text_inputs['attention_mask']#torch.zeros_like(text_input)
+    #for i in range(len(mask)):
+    #    mask[i][0:txt_len[i]+1] = 1
+
+    # For special tokens, only use [EOS]
+    # txt_len = text_input.argmax(dim=-1)
+    # mask = torch.zeros_like(text_input)
+    # for i in range(len(mask)):
+    #     mask[i][1:txt_len[i]+1] = 1
+
+    # # For special tokens, don't use [SOS] and [EOS]
+    # txt_len = text_input.argmax(dim=-1)
+    # mask = torch.zeros_like(text_input)
+    # for i in range(len(mask)):
+    #     mask[i][1:txt_len[i]] = 1
+
+    idf_weights = torch.tensor([[idf_dict[int(i)] for i in a] for a in text_input.cpu()])
+
+    return sen_features, mask, idf_weights, word_features
+
+
+def process(a, tokenizer=None):
+    if tokenizer is not None:
+        a = tokenizer(a)[0].tolist()
+    return set(a)
+
+
+def get_idf_dict(arr, tokenizer, nthreads=4):
+    """
+    Returns mapping from word piece index to its inverse document frequency.
+
+
+    Args:
+        - :param: `arr` (list of str) : sentences to process.
+        - :param: `tokenizer` : a BERT tokenizer corresponds to `model`.
+        - :param: `nthreads` (int) : number of CPU threads to use
+    """
+    idf_count = Counter()
+    num_docs = len(arr)
+
+    process_partial = partial(process, tokenizer=tokenizer)
+
+    with Pool(nthreads) as p:
+        idf_count.update(chain.from_iterable(p.map(process_partial, arr)))
+
+    idf_dict = defaultdict(lambda: log((num_docs + 1) / (1)))
+    idf_dict.update({idx: log((num_docs + 1) / (c + 1)) for (idx, c) in idf_count.items()})
+    return idf_dict
+
+
+def refs_greedy_cos(ref_embedding, ref_masks, ref_idf, hyp_embedding, hyp_masks, hyp_idf, return_matched_idx):
+    """
+    Compute greedy matching based on cosine similarity.
+
+    Args:
+        - :param: `ref_embedding` (torch.Tensor):
+                   embeddings of reference sentences, BxKxd,
+                   B: batch size, K: longest length, d: bert dimenison.
+        - :param: `ref_masks` (torch.LongTensor): BxKxK, BERT attention mask for
+                   reference sentences.
+        - :param: `hyp_embedding` (torch.Tensor):
+                   embeddings of candidate sentences, BxKxd,
+                   B: batch size, K: longest length, d: bert dimenison
+        - :param: `hyp_masks` (torch.LongTensor): BxKxK, BERT attention mask for
+                   candidate sentences.
+    """
+    # ref_embedding and hyp_embedding are aleady L2-normalized.
+
+    batch_size = ref_embedding.size(0)
+    sim = torch.bmm(hyp_embedding, ref_embedding.transpose(1, 2))
+    masks = torch.bmm(hyp_masks.unsqueeze(2).float(), ref_masks.unsqueeze(1).float())
+    masks = masks.expand(batch_size, -1, -1).contiguous().view_as(sim)
+    masks = masks.float().to(sim.device)
+    sim = sim * masks
+
+    word_precision, matched_indices = sim.max(dim=2)
+    word_recall = sim.max(dim=1)[0]
+
+    hyp_idf.div_(hyp_idf.sum(dim=1, keepdim=True))
+    ref_idf.div_(ref_idf.sum(dim=1, keepdim=True))
+    precision_scale = hyp_idf.to(word_precision.device)
+    #print(precision_scale)
+    recall_scale = ref_idf.to(word_recall.device)
+
+    #P = (word_precision * precision_scale).sum(dim=1)
+    P = (word_precision).sum(dim=1)
+    R = (word_recall).sum(dim=1) / ref_masks.sum(dim=1)
+    F = 2 * P * R / (P + R)
+
+    if return_matched_idx:
+        return P, R, F, matched_indices
+    else:
+        return P, R, F, torch.zeros_like(P)
+
+def vid_greedy_cos(ref_embedding, ref_masks, hyp_embedding, hyp_masks, hyp_idf, return_matched_idx):
+    """
+    Compute greedy matching based on cosine similarity.
+
+    Args:
+        - :param: `ref_embedding` (torch.Tensor):
+                   embeddings of reference sentences, BxKxd,
+                   B: batch size, K: longest length, d: bert dimenison.
+        - :param: `ref_masks` (torch.LongTensor): BxKxK, BERT attention mask for
+                   reference sentences.
+        - :param: `hyp_embedding` (torch.Tensor):
+                   embeddings of candidate sentences, BxKxd,
+                   B: batch size, K: longest length, d: bert dimenison
+        - :param: `hyp_masks` (torch.LongTensor): BxKxK, BERT attention mask for
+                   candidate sentences.
+    """
+    # ref_embedding and hyp_embedding are aleady L2-normalized.
+    batch_size = ref_embedding.size(0)
+    sim = torch.bmm(hyp_embedding, ref_embedding.transpose(1, 2))
+    masks = torch.bmm(hyp_masks.unsqueeze(2).float(), ref_masks.unsqueeze(1).float())
+    masks = masks.expand(batch_size, -1, -1).contiguous().view_as(sim)
+    masks = masks.float().to(sim.device)
+    sim = sim * masks
+
+    word_precision, matched_indices = sim.max(dim=2)
+    word_recall = sim.max(dim=1)[0]
+
+    hyp_idf.div_(hyp_idf.sum(dim=1, keepdim=True))
+    precision_scale = hyp_idf.to(word_precision.device)
+    #print(precision_scale)
+    P = (word_precision).sum(dim=1)
+    #P = (word_precision * precision_scale).sum(dim=1)
+    R = word_recall.sum(dim=1) / ref_masks.sum(dim=1)
+    F = 2 * P * R / (P + R)
+
+    if return_matched_idx:
+        return P, R, F, matched_indices
+    else:
+        return P, R, F, torch.zeros_like(P)
+
+
+
+def em_cos_score(
+    model, text_model, refs, hyps, ori_cands, ori_refs, vids, vid_feat_cache, tokenizer, idf_dict, preprocess, verbose=True, batch_size=64, device="cuda:0", return_matched_idx=False):
+    """
+    Compute EMScore.
+
+    Args:
+        - :param: `model` : a BERT model in `pytorch_pretrained_bert`
+        - :param: `refs` (list of str): reference sentences
+        - :param: `hyps` (list of str): candidate sentences
+        - :param: `tokenzier` : a BERT tokenizer corresponds to `model`
+        - :param: `verbose` (bool): turn on intermediate status update
+        - :param: `batch_size` (int): bert score processing batch size
+        - :param: `device` (str): device to use, e.g. 'cpu' or 'cuda'
+    """
+
+    refs_preds_local = []
+    refs_pred_matched_idxs = []
+    refs_preds_global = []
+
+    vid_preds_local = []
+    vid_pred_matched_idxs = []
+    vid_preds_global = []
+
+
+    """process text"""
+    def dedup_and_sort(l):
+        return sorted(list(set(l)), key=lambda x: len(x.split(" ")), reverse=True)
+
+    sentences = dedup_and_sort(refs + hyps)
+    embs = []
+    iter_range = range(0, len(sentences), batch_size)
+    if verbose:
+        print("computing text embedding.")
+        iter_range = tqdm(iter_range)
+    text_local_stats_dict = dict()
+    text_global_stats_dict = dict()
+    for batch_start in iter_range:
+        sen_batch = sentences[batch_start: batch_start + batch_size]
+        embs, masks, text_idfs, word_embs = encode_text(sen_batch, model, text_model, tokenizer, idf_dict, device=device)
+        embs = embs.cpu()
+        masks = masks.cpu()
+        #word_embs = word_embs.cpu()
+        #print(embs.shape)
+        for i, sen in enumerate(sen_batch):
+            sequence_len = masks[i].sum().item()
+
+            # For special tokens, use [SOS] and [EOS]
+
+            local_emb = word_embs[i].cpu()#].unsqueeze(0)#, 0:sequence_len]
+            global_emb = embs[i]#].unsqueeze(0)#, sequence_len-1]
+            #print(global_emb.shape)
+            #print(local_emb.shape)
+            idf = text_idfs[i, 0:local_emb.size(0)]
+            '''
+            local_emb = embs[i].unsqueeze(0)#, 0:sequence_len]
+            global_emb = embs[i]  # ].unsqueeze(0)#, sequence_len-1]
+            # print(global_emb.shape)
+            # print(local_emb.shape)
+            idf = text_idfs[i,sequence_len-1:sequence_len]#text_idfs[i, 0]
+            '''
+
+
+            # For special tokens, don't use any
+            # local_emb = embs[i, 1:sequence_len+1]
+            # global_emb = embs[i, sequence_len+1]
+            # idf = text_idfs[i, 1:sequence_len+1]
+
+            # For special tokens, only use [EOS]
+            # local_emb = embs[i, 1:sequence_len+1]
+            # global_emb = embs[i, sequence_len]
+            # idf = text_idfs[i, 1:sequence_len+1]
+
+            text_local_stats_dict[sen] = (local_emb, idf)
+            text_global_stats_dict[sen] = global_emb
+
+
+    """process video"""
+    if vids:
+        if vid_feat_cache:
+            ori_vids = vids
+            vid_local_stats_dict = vid_feat_cache
+            vid_global_stats_dict = dict()
+            for vid in vid_local_stats_dict:
+                image_features = vid_local_stats_dict[vid]
+                vid_feature = normalize_matrix(torch.mean(image_features, dim=0, keepdim=True)).squeeze()
+                vid_global_stats_dict[vid] = vid_feature
+        else:
+            ori_vids = vids # video paths list
+            unique_vids = list(set(vids))
+            if verbose:
+                print("computing vid embedding.")
+            vid_local_stats_dict = dict()
+            vid_global_stats_dict = dict()
+            for vid_i in tqdm(range(len(unique_vids))):
+                video_file = unique_vids[vid_i]
+                image_features, vid_feature = encode_video(video_file, preprocess, model, batch_size=512, device=device)
+                # vid_name = video_file.split('/')[-1][:-4]
+                vid_local_stats_dict[video_file] = image_features.cpu()
+                vid_global_stats_dict[video_file] = vid_feature.cpu()
+
+
+    def pad_local_batch_stats(sen_batch, stats_dict, device):
+        stats = [stats_dict[s] for s in sen_batch]
+        emb, idf = zip(*stats)
+        emb = [e.to(device) for e in emb]
+        lens = [e.size(0) for e in emb]
+        emb_pad = pad_sequence(emb, batch_first=True, padding_value=0.0)
+        idf_pad = pad_sequence(idf, batch_first=True)
+
+        def length_to_mask(lens):
+            lens = torch.tensor(lens, dtype=torch.long)
+            max_len = max(lens)
+            base = torch.arange(max_len, dtype=torch.long).expand(len(lens), max_len)
+            return base < lens.unsqueeze(1)
+
+        pad_mask = length_to_mask(lens).to(device)
+        return emb_pad, pad_mask, idf_pad
+
+    def pad_vid_local_batch_stats(sen_batch, stats_dict, device):
+        stats = [stats_dict[s] for s in sen_batch]
+        emb = stats
+        emb = [e.to(device) for e in emb]
+        lens = [e.size(0) for e in emb]
+        emb_pad = pad_sequence(emb, batch_first=True, padding_value=0.0)
+
+        def length_to_mask(lens):
+            lens = torch.tensor(lens, dtype=torch.long)
+            max_len = max(lens)
+            base = torch.arange(max_len, dtype=torch.long).expand(len(lens), max_len)
+            return base < lens.unsqueeze(1)
+
+        pad_mask = length_to_mask(lens).to(device)
+        return emb_pad, pad_mask
+
+    def pad_global_batch_stats(sen_batch, stats_dict, device):
+        stats = [stats_dict[s] for s in sen_batch]
+        emb = stats
+        emb = [e.to(device) for e in emb]
+        #print(emb)
+        emb_pad = pad_sequence(emb, batch_first=True, padding_value=0.0)
+        return emb_pad
+
+    """ if references are avaliable """
+    if refs:
+        iter_range = range(0, len(hyps), batch_size)
+        if verbose:
+            print("computing greedy matching, references as ground truth.")
+            iter_range = tqdm(iter_range)
+
+        with torch.no_grad():
+            for batch_start in iter_range:
+                batch_hyps = hyps[batch_start: batch_start + batch_size]
+                hyp_stats_local = pad_local_batch_stats(batch_hyps, text_local_stats_dict, device)
+                hyp_stats_global = pad_global_batch_stats(batch_hyps, text_global_stats_dict, device)
+
+                batch_refs = refs[batch_start: batch_start + batch_size]
+                ref_stats_local = pad_local_batch_stats(batch_refs, text_local_stats_dict, device)
+                ref_stats_global = pad_global_batch_stats(batch_refs, text_global_stats_dict, device)
+
+                P, R, F1, matched_indices = refs_greedy_cos(*ref_stats_local, *hyp_stats_local, return_matched_idx)
+                refs_preds_local.append(torch.stack((P, R, F1), dim=-1).cpu())
+                refs_pred_matched_idxs.append(matched_indices)
+
+                refs_s_cogr = torch.bmm(hyp_stats_global.unsqueeze(1), ref_stats_global.unsqueeze(1).transpose(1,2)).squeeze()
+                refs_preds_global.append(refs_s_cogr)
+
+
+    """ if video used as ground truth """
+    if vids:
+        if verbose:
+            print("computing greedy matching, video as ground truth.")
+        iter_range = range(0, len(ori_cands), batch_size)
+        with torch.no_grad():
+            for batch_start in iter_range:
+                batch_ori_hyp = ori_cands[batch_start: batch_start + batch_size]
+                #print(text_local_stats_dict)
+                #print(text_global_stats_dict)
+                ori_hyp_stats_local = pad_local_batch_stats(batch_ori_hyp, text_local_stats_dict, device)
+                ori_hyp_stats_global = pad_global_batch_stats(batch_ori_hyp, text_global_stats_dict, device)
+
+                batch_ori_vids = ori_vids[batch_start: batch_start + batch_size]
+                ori_vids_stats_local = pad_vid_local_batch_stats(batch_ori_vids, vid_local_stats_dict, device)
+                ori_vids_stats_global = pad_global_batch_stats(batch_ori_vids, vid_global_stats_dict, device)
+
+                P, R, F1, matched_indices = vid_greedy_cos(*ori_vids_stats_local, *ori_hyp_stats_local, return_matched_idx)
+                vid_preds_local.append(torch.stack((P, R, F1), dim=-1).cpu())
+                vid_pred_matched_idxs.append(matched_indices)
+
+                vid_s_cogr = torch.bmm(ori_hyp_stats_global.unsqueeze(1), ori_vids_stats_global.unsqueeze(1).transpose(1, 2)).squeeze()
+                vid_preds_global.append(vid_s_cogr)
+
+
+    results = dict()
+    """ if references are avaliable """
+    if refs:
+        refs_preds_local = torch.cat(refs_preds_local, dim=0).cpu()
+        if len(refs) != 1:
+            refs_preds_global = torch.cat(refs_preds_global, dim=0).cpu()
+        else:
+            refs_preds_global = refs_preds_global[0].cpu()
+        results['refs_result'] = {}
+        results['refs_result']['figr'] = refs_preds_local
+        results['refs_result']['cogr'] = refs_preds_global
+        results['refs_result']['matched_indices'] = torch.cat(refs_pred_matched_idxs)
+
+    """ if video used as ground truth """
+    if vids:
+        vid_preds_local = torch.cat(vid_preds_local, dim=0).cpu()
+        if len(vids) != 1:
+            vid_preds_global = torch.cat(vid_preds_global, dim=0).cpu()
+        else:
+            vid_preds_global = vid_preds_global[0].cpu()
+        results['vid_result'] = {}
+        results['vid_result']['figr'] = vid_preds_local
+        results['vid_result']['cogr'] = vid_preds_global
+        results['vid_result']['matched_indices'] = torch.cat(vid_pred_matched_idxs)
+
+
+    return results

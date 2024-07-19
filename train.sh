@@ -1,0 +1,26 @@
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 --master_port 29001 train_on_local.py \
+    --data_path data/split/training_data.json \
+    --pretrain_path /pretrained_models/baichuan-7b-sft/\
+    --video_data_path /data_process/video_feas_mem_compress \
+    --resume_path None \
+    --output_dir tmp_ckpt \
+    --fp16 True \
+    --tune_mm_mlp_adapter False \
+    --lora_enable True \
+    --num_train_epochs 15\
+    --dataloader_num_workers 1 \
+    --per_device_train_batch_size 4 \
+    --per_device_eval_batch_size 1 \
+    --gradient_accumulation_steps 8 \
+    --evaluation_strategy no \
+    --save_strategy steps \
+    --save_steps 100 \
+    --save_total_limit 1 \
+    --learning_rate 1e-4 \
+    --weight_decay 0. \
+    --warmup_ratio 0.03 \
+    --lr_scheduler_type cosine \
+    --logging_steps 20 \
+    --gradient_checkpointing True \
+    --model_name_or_path None \
+    --deepspeed=deep_config.json
