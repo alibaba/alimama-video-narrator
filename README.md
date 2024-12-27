@@ -28,8 +28,8 @@ In this work, we introduce a new task of **Synchronized Video Storytelling**, wh
 </div>
 
 ## Release :loudspeaker:
-
-- **2024/07/17**: Our code and dataset annotations are released. Video features will be available soon.
+- **2024/12**: Video frame features and models can be accessed via [Onedrive](https://1drv.ms/f/c/3c3420da34ad1fab/EqsfrTTaIDQggDxqAAAAAAABghPP_LC2bZfMMeCiR_Z8FQ?e=j537Xs). 
+- **2024/07**: Our code and dataset annotations are released. Video features will be available soon.
 
 ## Contents
 - [Abstract](#abstract)
